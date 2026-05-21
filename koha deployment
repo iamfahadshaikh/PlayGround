@@ -1,0 +1,173 @@
+
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~/koha-docker]
+└─$ ls
+docker-compose.ncip.yml  docker-compose.yml  docker-compose.ymlnotworking  Dockerfile  env  LICENSE  README.md  scripts  templates
+
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~/koha-docker]
+└─$ cat docker-compose.yml
+services:
+  db:
+    image: mariadb:10.11
+    container_name: koha-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+    volumes:
+      - koha-db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks:
+      - koha-net
+
+  memcached:
+    image: memcached:latest
+    container_name: koha-memcached
+    restart: unless-stopped
+    networks:
+      - koha-net
+
+  elasticsearch:
+    image: koha/opensearch-icu:2
+    container_name: koha-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: "true"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: "StrongPassword123!"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    networks:
+      - koha-net
+
+  koha:
+    build: .
+    image: koha-custom
+    container_name: koha
+    restart: unless-stopped
+    user: root
+    privileged: true
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      KOHA_INSTANCE: library
+      MYSQL_SERVER: db
+      MYSQL_ROOT_USER: root
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_PASSWORD: strongpassword
+      OVERRIDE_SYSPREF_SearchEngine: Zebra
+      USE_BACKEND: "true"
+      USE_MEMCACHED: "true"
+      MEMCACHED_SERVERS: memcached:11211
+      USE_APACHE2: "true"
+      USE_CRON: "true"
+      KOHA_INTRANET_PORT: 8081
+      KOHA_OPAC_PORT: 8080
+      KOHA_LANGS: "en"
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    volumes:
+      - koha-shared-data:/var/lib/koha
+      - koha-config-data:/etc/koha/sites
+      - koha-log-data:/var/log/koha
+    networks:
+      - koha-net
+
+networks:
+  koha-net:
+    driver: bridge
+
+volumes:
+  koha-db-data:
+  koha-shared-data:
+  koha-config-data:
+  koha-log-data:
+
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~/koha-docker]
+└─$
+
+
+azureuser@Ubuntu-Server:/opt/koha-docker$ sudo rm docker-compose.yml
+azureuser@Ubuntu-Server:/opt/koha-docker$ sudo cp docker-compose.yml.workinbuterror docker-compose.yml
+azureuser@Ubuntu-Server:/opt/koha-docker$ sudo docker compose down
+[+] down 5/5
+ ✔ Container koha-memcached     Removed                                                           0.3s
+ ✔ Container koha-elasticsearch Removed                                                           0.5s
+ ✔ Container koha               Removed                                                          10.3s
+ ✔ Container koha-db            Removed                                                           0.5s
+ ✔ Network koha-docker_koha-net Removed                                                           0.1s
+azureuser@Ubuntu-Server:/opt/koha-docker$ # 1. Clean up any stuck states
+sudo docker compose down -v
+
+# 2. Start the containers
+sudo docker compose up -d
+
+# 3. Wait for the Database (Vital on Azure VMs)
+echo "Waiting 60 seconds for MariaDB to initialize..."
+sleep 60
+
+# 4. Re-apply the Database Privileges
+sudo docker exec -it koha-db mariadb -u root -prootpassword -e "GRANT ALL PRIVILEGES ON koha_library.* TO 'koha_library'@'%' IDENTIFIED BY 'strongpassword'; FLUSH PRIVILEGES;"
+
+# 5. The "Azure Security Bypass" (Re-apply because the volume was reset)
+# This disables the module Azure fights with and fixes the config
+sudo docker exec -it koha a2dismod mpm_itk
+sudo docker exec -it koha a2enmod mpm_prefork
+sudo docker exec -it koha sed -i '/AssignUserID/d' /etc/apache2/sites-enabled/library.conf
+
+# 6. Fix internal log permissions for the new volume
+sudo docker exec -it koha mkdir -p /var/log/koha/library
+sudo docker exec -it koha chmod -R 777 /var/log/koha
+
+# 7. Restart the services
+sudo docker exec -it koha supervisorctl restart apache2
+sudo docker exec -it koha supervisorctl restart plack
+
+# 8. Re-populate the Database (The volume deletion emptied the tables)
+sudo docker exec -it koha koha-create --create-db --dbhost db library
+[+] down 4/4
+ ✔ Volume koha-docker_koha-db-data     Removed                                                    0.0s
+ ✔ Volume koha-docker_koha-log-data    Removed                                                    0.0s
+ ✔ Volume koha-docker_koha-shared-data Removed                                                    0.0s
+ ✔ Volume koha-docker_koha-config-data Removed                                                    0.0s
+[+] up 9/9
+ ✔ Network koha-docker_koha-net        Created                                                    0.1s
+ ✔ Volume koha-docker_koha-db-data     Created                                                    0.0s
+ ✔ Volume koha-docker_koha-shared-data Created                                                    0.0s
+ ✔ Volume koha-docker_koha-config-data Created                                                    0.0s
+ ✔ Volume koha-docker_koha-log-data    Created                                                    0.0s
+ ✔ Container koha-db                   Healthy                                                   12.9s
+ ✔ Container koha-memcached            Started                                                    2.4s
+ ✔ Container koha-elasticsearch        Started                                                    2.5s
+ ✔ Container koha                      Started                                                   12.5s
+Waiting 60 seconds for MariaDB to initialize...
+Module mpm_itk disabled.
+To activate the new configuration, you need to run:
+  service apache2 restart
+Considering conflict mpm_event for mpm_prefork:
+Considering conflict mpm_worker for mpm_prefork:
+Module mpm_prefork already enabled
+apache2: stopped
+apache2: ERROR (spawn error)
+plack: stopped
+plack: started
+AH00558: apache2: Could not reliably determine the server's fully qualified domain name, using 172.18.0.5. Set the 'ServerName' directive globally to suppress this message
+AH00558: apache2: Could not reliably determine the server's fully qualified domain name, using 172.18.0.5. Set the 'ServerName' directive globally to suppress this message
+AH00558: apache2: Could not reliably determine the server's fully qualified domain name, using 172.18.0.5. Set the 'ServerName' directive globally to suppress this message
+
+Koha requires mpm_itk to be enabled within Apache in order to run.
+Typically this can be enabled with:
+
+    sudo a2enmod mpm_itk
+
+azureuser@Ubuntu-Server:/opt/koha-docker$ sudo docker exec -it koha supervisorctl status
+apache2                          FATAL     Exited too quickly (process log may have details)
+apache_vhost                     RUNNING   pid 292, uptime 0:01:15
+cron                             RUNNING   pid 288, uptime 0:01:15
+plack                            RUNNING   pid 415, uptime 0:00:12
+zebra_indexer                    RUNNING   pid 294, uptime 0:01:15
+zebra_server                     RUNNING   pid 295, uptime 0:01:14
+azureuser@Ubuntu-Server:/opt/koha-docker$
