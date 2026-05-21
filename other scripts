@@ -1,0 +1,482 @@
+
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~]
+└─$ ls
+azagent         github                 opencti                         secret-cleaner.sh    testing.sh                 VAPT-Automated-Engine
+azure-info.txt  go                     pip_report_20260211_171030.txt  splunk               test-package.sh            version.sh
+azureworkshop   hydra.restore          rajat                           splunkforwarder.tgz  test.py                    wazuh.sh
+cewl            koha-docker            remove-nginx-modsecurity.sh     subs.txt             testssl.sh-3.2.2           zap-output
+falco           new-modsec-install.sh  report.html                     testenv              testssl.sh-3.2.2.tar.gz.1
+
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~]
+└─$ cat testing.sh
+#!/usr/bin/env bash
+
+OUTPUT="pip_report_$(date +%Y%m%d_%H%M%S).txt"
+
+echo "Generating pip intelligence report..."
+echo "Output: $OUTPUT"
+echo
+
+{
+    echo "=============================="
+    echo "INSTALLED PACKAGES"
+    echo "=============================="
+    echo
+    python3 -m pip list
+    echo
+    echo "=============================="
+    echo "PACKAGE DETAILS"
+    echo "=============================="
+    echo
+
+    python3 -m pip list --format=freeze | cut -d '=' -f1 | while read pkg; do
+        echo "----------------------------------------"
+        echo "PACKAGE: $pkg"
+        echo "----------------------------------------"
+        python3 -m pip show "$pkg"
+        echo
+    done
+
+} > "$OUTPUT"
+
+echo "Done."
+
+
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~]
+└─$ cat test-package.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+TMPDIR=$(mktemp -d)
+
+# Current snapshot
+pip freeze | sort > "$TMPDIR/current.txt"
+
+# Simulate upgrade resolution
+pip install --upgrade --dry-run $(cut -d= -f1 "$TMPDIR/current.txt") \
+  2>/dev/null | \
+  grep "Would install" | \
+  sed 's/Would install //' | \
+  tr ' ' '\n' | \
+  sed '/^$/d' | \
+  sort > "$TMPDIR/upgrade_sim.txt" || true
+
+# Normalize upgrade list
+> "$TMPDIR/upgrade_clean.txt"
+while read -r line; do
+    pkg=$(echo "$line" | sed 's/-[0-9].*//' )
+    ver=$(echo "$line" | grep -o '[0-9].*')
+    echo "$pkg==$ver" >> "$TMPDIR/upgrade_clean.txt"
+done < "$TMPDIR/upgrade_sim.txt"
+
+sort -o "$TMPDIR/upgrade_clean.txt" "$TMPDIR/upgrade_clean.txt"
+
+TOTAL=$(wc -l < "$TMPDIR/current.txt")
+
+printf "\n"
+printf "%-25s %-15s %-15s %-15s %-15s\n" \
+"PACKAGE" "CURRENT" "LATEST" "STATUS" "CHANGE_TYPE"
+printf "%-25s %-15s %-15s %-15s %-15s\n" \
+"-------------------------" "---------------" "---------------" "---------------" "---------------"
+
+while read -r line; do
+    pkg=$(echo "$line" | cut -d= -f1)
+    cur=$(echo "$line" | cut -d= -f3)
+
+    new_line=$(grep "^$pkg==" "$TMPDIR/upgrade_clean.txt" || true)
+
+    if [[ -n "$new_line" ]]; then
+        new_ver=$(echo "$new_line" | cut -d= -f3)
+        if [[ "$cur" != "$new_ver" ]]; then
+            printf "%-25s %-15s %-15s %-15s %-15s\n" \
+            "$pkg" "$cur" "$new_ver" "UPDATE" "VERSION_CHANGE"
+        else
+            printf "%-25s %-15s %-15s %-15s %-15s\n" \
+            "$pkg" "$cur" "$cur" "OK" "-"
+        fi
+    else
+        printf "%-25s %-15s %-15s %-15s %-15s\n" \
+        "$pkg" "$cur" "-" "REMOVED" "NOT_IN_RESOLUTION"
+    fi
+done < "$TMPDIR/current.txt"
+
+# New packages introduced
+while read -r line; do
+    pkg=$(echo "$line" | cut -d= -f1)
+    if ! grep -q "^$pkg==" "$TMPDIR/current.txt"; then
+        new_ver=$(echo "$line" | cut -d= -f3)
+        printf "%-25s %-15s %-15s %-15s %-15s\n" \
+        "$pkg" "-" "$new_ver" "ADDED" "NEW_DEP"
+    fi
+done < "$TMPDIR/upgrade_clean.txt"
+
+printf "\nTOTAL PACKAGES: %s\n" "$TOTAL"
+
+rm -rf "$TMPDIR"
+
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~]
+└─$ cat test.py
+#!/usr/bin/env python3
+
+import argparse
+import ast
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import List, Set
+from packaging.version import Version
+import requests
+
+
+# -----------------------------
+# DATA MODELS
+# -----------------------------
+
+@dataclass
+class VersionPair:
+    name: str
+    current: str
+    latest: str
+
+
+@dataclass
+class DiffResult:
+    package: str
+    current: str
+    latest: str
+    major_change: bool
+    files_added: List[str]
+    files_removed: List[str]
+    api_added: List[str]
+    api_removed: List[str]
+    dependencies_added: List[str]
+    dependencies_removed: List[str]
+    warnings_found: List[str]
+    security_issues: List[str]
+
+
+# -----------------------------
+# CORE UTILITIES
+# -----------------------------
+
+def run(cmd: List[str]) -> str:
+    return subprocess.check_output(cmd, text=True)
+
+
+def get_outdated() -> List[VersionPair]:
+    data = json.loads(
+        subprocess.check_output(
+            [sys.executable, "-m", "pip", "list", "--outdated", "--format=json"],
+            text=True,
+        )
+    )
+    return [
+        VersionPair(p["name"], p["version"], p["latest_version"])
+        for p in data
+    ]
+
+
+def is_major_change(old: str, new: str) -> bool:
+    try:
+        return Version(old).major != Version(new).major
+    except Exception:
+        return False
+
+
+def download_package(pkg: str, version: str, target: Path) -> Path | None:
+    cmd = [
+        sys.executable, "-m", "pip", "download",
+        f"{pkg}=={version}",
+        "--no-deps",
+        "--no-binary=:all:",
+        "-d", str(target),
+    ]
+
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        print(f"[!] Skipping {pkg}=={version} (not available on PyPI)")
+        return None
+
+    archives = list(target.iterdir())
+    if not archives:
+        return None
+
+    return max(archives, key=lambda p: p.stat().st_mtime)
+
+
+# -----------------------------
+# SAFE EXTRACTION
+# -----------------------------
+
+def extract_archive(archive: Path, dest: Path):
+    if archive.suffix in [".whl", ".zip"]:
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(dest)
+
+    elif archive.suffix in [".gz", ".tgz"] or archive.name.endswith(".tar.gz"):
+        with tarfile.open(archive) as t:
+            t.extractall(dest, filter="data")
+
+
+# -----------------------------
+# FILE DIFF
+# -----------------------------
+
+def list_py_files(root: Path) -> Set[str]:
+    return {
+        str(p.relative_to(root))
+        for p in root.rglob("*.py")
+    }
+
+
+# -----------------------------
+# API EXTRACTION
+# -----------------------------
+
+def extract_api_symbols(root: Path) -> Set[str]:
+    symbols = set()
+
+    for file in root.rglob("*.py"):
+        try:
+            tree = ast.parse(file.read_text(errors="ignore"))
+        except Exception:
+            continue
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                if not node.name.startswith("_"):
+                    symbols.add(node.name)
+
+    return symbols
+
+
+# -----------------------------
+# DEPENDENCY EXTRACTION
+# -----------------------------
+
+def extract_dependencies(root: Path) -> Set[str]:
+    deps = set()
+
+    for file in root.rglob("pyproject.toml"):
+        text = file.read_text(errors="ignore")
+        for line in text.splitlines():
+            if "dependencies" in line.lower():
+                deps.add(line.strip())
+
+    for file in root.rglob("setup.py"):
+        text = file.read_text(errors="ignore")
+        if "install_requires" in text:
+            deps.add("install_requires_found")
+
+    return deps
+
+
+# -----------------------------
+# WARNING SCAN
+# -----------------------------
+
+WARNING_KEYWORDS = [
+    "DeprecationWarning",
+    "FutureWarning",
+    "PendingDeprecationWarning",
+    "deprecated",
+    "removed",
+    "breaking",
+]
+
+
+def scan_warnings(root: Path) -> List[str]:
+    findings = []
+    for file in root.rglob("*.py"):
+        text = file.read_text(errors="ignore")
+        for kw in WARNING_KEYWORDS:
+            if kw in text:
+                findings.append(f"{file.name}: contains '{kw}'")
+    return findings
+
+
+# -----------------------------
+# SECURITY CHECK
+# -----------------------------
+
+def get_security_issues(package: str) -> List[str]:
+    try:
+        output = subprocess.check_output(
+            [sys.executable, "-m", "pip_audit"],
+            text=True,
+        )
+        return [
+            line for line in output.splitlines()
+            if package.lower() in line.lower()
+        ]
+    except Exception:
+        return []
+
+
+# -----------------------------
+# ANALYSIS ENGINE
+# -----------------------------
+
+def analyze(pair: VersionPair) -> DiffResult | None:
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "new"
+        old_dir.mkdir()
+        new_dir.mkdir()
+
+        old_archive = download_package(pair.name, pair.current, tmp_path)
+        new_archive = download_package(pair.name, pair.latest, tmp_path)
+
+        if not old_archive or not new_archive:
+            print(f"[!] Skipping {pair.name} (missing source)")
+            return None
+
+        extract_archive(old_archive, old_dir)
+        extract_archive(new_archive, new_dir)
+
+        old_files = list_py_files(old_dir)
+        new_files = list_py_files(new_dir)
+
+        old_api = extract_api_symbols(old_dir)
+        new_api = extract_api_symbols(new_dir)
+
+        old_deps = extract_dependencies(old_dir)
+        new_deps = extract_dependencies(new_dir)
+
+        return DiffResult(
+            package=pair.name,
+            current=pair.current,
+            latest=pair.latest,
+            major_change=is_major_change(pair.current, pair.latest),
+            files_added=list(new_files - old_files),
+            files_removed=list(old_files - new_files),
+            api_added=list(new_api - old_api),
+            api_removed=list(old_api - new_api),
+            dependencies_added=list(new_deps - old_deps),
+            dependencies_removed=list(old_deps - new_deps),
+            warnings_found=scan_warnings(new_dir),
+            security_issues=get_security_issues(pair.name),
+        )
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Dependency Intelligence Engine")
+    parser.add_argument("--major-only", action="store_true")
+    parser.add_argument("--package", help="Analyze single package only")
+    parser.add_argument("--output", default="report.json")
+    args = parser.parse_args()
+
+    outdated = get_outdated()
+    results = []
+
+    for pair in outdated:
+        if args.package and pair.name != args.package:
+            continue
+
+        if args.major_only and not is_major_change(pair.current, pair.latest):
+            continue
+
+        print(f"[+] Analyzing {pair.name} {pair.current} → {pair.latest}")
+
+        result = analyze(pair)
+        if result:
+            results.append(asdict(result))
+
+    Path(args.output).write_text(json.dumps(results, indent=2))
+    print(f"\nReport written to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
+
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~]
+└─$ cat version.sh
+#!/usr/bin/env bash
+
+set -e
+
+echo "Updating package metadata..."
+sudo apt update -qq
+
+echo
+echo "===== APT PACKAGES ====="
+
+apt list --installed 2>/dev/null | tail -n +2 | cut -d/ -f1 | while read -r pkg; do
+    installed=$(dpkg -s "$pkg" 2>/dev/null | awk -F': ' '/^Version/ {print $2}')
+    candidate=$(apt-cache policy "$pkg" | awk '/Candidate:/ {print $2}')
+
+    if [[ -n "$installed" && -n "$candidate" && "$installed" != "$candidate" && "$candidate" != "(none)" ]]; then
+        echo "Package: $pkg"
+        echo "Installed: $installed"
+        echo "Latest:    $candidate"
+        echo
+    fi
+done
+
+
+echo
+echo "===== PYTHON PACKAGES (pip) ====="
+
+pip list --format=freeze | while IFS== read -r pkg installed; do
+    latest=$(pip index versions "$pkg" 2>/dev/null | awk -F': ' '/LATEST/ {print $2}')
+
+    if [[ -n "$latest" && "$installed" != "$latest" ]]; then
+        echo "Package: $pkg"
+        echo "Installed: $installed"
+        echo "Latest:    $latest"
+        echo
+    fi
+done
+
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~]
+└─$ cat wazuh.sh
+#!/bin/bash
+set -e
+
+echo "[+] Cleaning old Wazuh setup..."
+sudo rm -rf ~/wazuh-docker/ || true
+sudo docker rm -f $(sudo docker ps -aq) 2>/dev/null || true
+sudo docker system prune -af --volumes -f
+
+echo "[+] Cloning Wazuh Docker repository (v4.14.0)..."
+cd ~
+git clone https://github.com/wazuh/wazuh-docker.git -b v4.14.0
+cd wazuh-docker/single-node/
+
+echo "[+] Generating self-signed certificates..."
+sudo docker compose -f generate-indexer-certs.yml run --rm generator
+
+echo "[+] Checking generated certificates..."
+sudo ls -l ./config/wazuh_indexer_ssl_certs/
+
+echo "[+] Deploying Wazuh single-node stack..."
+sudo docker compose up -d
+
+echo "[+] Deployment started. Containers coming up..."
+echo "Use: watch sudo docker ps -a"
+echo "Access dashboard after ~2 minutes:"
+echo "URL: https://<YOUR_VM_PUBLIC_IP>"
+echo "Username: admin"
+echo "Password: SecretPassword"
+
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~]
+└─$
