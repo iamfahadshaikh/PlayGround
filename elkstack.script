@@ -1,0 +1,204 @@
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~]
+└─$ cat elkstack.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+ES_PORT=9200
+KIBANA_PORT=5601
+WORKDIR="/opt/elk-platform"
+
+log(){ echo -e "\n[+] $1\n"; }
+err(){ echo -e "\n[!] ERROR: $1\n"; exit 1; }
+
+wait_es() {
+  log "Waiting for Elasticsearch..."
+  until curl -s http://127.0.0.1:${ES_PORT} >/dev/null; do sleep 3; done
+}
+
+wait_kibana() {
+  log "Waiting for Kibana..."
+  until curl -s http://127.0.0.1:${KIBANA_PORT}/api/status | grep -q available; do sleep 5; done
+}
+
+wait_fleet() {
+  log "Waiting for Fleet initialization..."
+  for i in {1..60}; do
+    if curl -s -u "elastic:${ELASTIC_PASS}" \
+      http://127.0.0.1:${KIBANA_PORT}/api/fleet/setup \
+      -H "kbn-xsrf: true" | grep -q '"isInitialized":true'; then
+        log "Fleet ready"
+        return
+    fi
+    sleep 5
+  done
+  err "Fleet not initialized"
+}
+
+[[ $EUID -ne 0 ]] && err "Run as root"
+
+########################################
+# SYSTEM
+########################################
+
+log "System prep"
+apt update -y
+apt install -y curl wget jq gnupg nginx ca-certificates openssl apt-transport-https
+
+sysctl -w vm.max_map_count=262144
+echo "vm.max_map_count=262144" > /etc/sysctl.d/99-elastic.conf
+
+########################################
+# REPO
+########################################
+
+mkdir -p /usr/share/keyrings
+curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch \
+ | gpg --dearmor -o /usr/share/keyrings/elastic.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/elastic.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main" \
+> /etc/apt/sources.list.d/elastic-8.x.list
+
+apt update -y
+
+########################################
+# ELASTICSEARCH
+########################################
+
+log "Installing Elasticsearch"
+apt install -y elasticsearch
+
+cat > /etc/elasticsearch/elasticsearch.yml <<EOF
+cluster.name: prod-elk
+node.name: node-1
+network.host: 127.0.0.1
+http.port: ${ES_PORT}
+discovery.type: single-node
+xpack.security.enabled: true
+EOF
+
+systemctl enable elasticsearch
+systemctl restart elasticsearch
+
+wait_es
+
+########################################
+# PASSWORDS
+########################################
+
+log "Generating passwords"
+
+ELASTIC_PASS=$(/usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -b -s)
+KIBANA_PASS=$(/usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana_system -b -s)
+
+echo "$ELASTIC_PASS" > /root/elastic.pass
+chmod 600 /root/elastic.pass
+
+########################################
+# KIBANA
+########################################
+
+log "Installing Kibana"
+apt install -y kibana
+
+cat > /etc/kibana/kibana.yml <<EOF
+server.host: "127.0.0.1"
+server.port: ${KIBANA_PORT}
+elasticsearch.hosts: ["http://127.0.0.1:${ES_PORT}"]
+elasticsearch.username: kibana_system
+elasticsearch.password: ${KIBANA_PASS}
+xpack.fleet.enabled: true
+xpack.encryptedSavedObjects.encryptionKey: "$(openssl rand -hex 32)"
+EOF
+
+systemctl enable kibana
+systemctl restart kibana
+
+wait_kibana
+
+########################################
+# FLEET SETUP
+########################################
+
+log "Initializing Fleet"
+
+curl -s -X POST "http://127.0.0.1:${KIBANA_PORT}/api/fleet/setup" \
+  -H "kbn-xsrf: true" \
+  -u "elastic:${ELASTIC_PASS}" \
+  -H "Content-Type: application/json" \
+  -d '{"forceRecreate": true}' >/dev/null
+
+wait_fleet
+
+########################################
+# POLICY
+########################################
+
+log "Creating Fleet policy"
+
+POLICY=$(curl -s -X POST \
+  "http://127.0.0.1:${KIBANA_PORT}/api/fleet/agent_policies" \
+  -H "kbn-xsrf: true" \
+  -u "elastic:${ELASTIC_PASS}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "fleet-server-policy",
+    "namespace": "default",
+    "monitoring_enabled": ["logs","metrics"],
+    "is_default_fleet_server": true
+  }')
+
+POLICY_ID=$(echo "$POLICY" | jq -r '.item.id')
+
+[[ -z "$POLICY_ID" || "$POLICY_ID" == "null" ]] && err "Policy failed"
+
+########################################
+# TOKEN
+########################################
+
+log "Creating enrollment token"
+
+TOKEN=$(curl -s -X POST \
+  "http://127.0.0.1:${KIBANA_PORT}/api/fleet/enrollment_api_keys" \
+  -H "kbn-xsrf: true" \
+  -u "elastic:${ELASTIC_PASS}" \
+  -H "Content-Type: application/json" \
+  -d "{\"policy_id\":\"$POLICY_ID\"}")
+
+ENROLL=$(echo "$TOKEN" | jq -r '.item.api_key')
+
+########################################
+# FLEET SERVER
+########################################
+
+log "Installing Fleet Server"
+
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+
+curl -L -o agent.tar.gz \
+https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-8.19.14-linux-x86_64.tar.gz
+
+tar -xzf agent.tar.gz
+cd elastic-agent-*/
+
+./elastic-agent install \
+  --fleet-server \
+  --url="http://127.0.0.1:${KIBANA_PORT}" \
+  --enrollment-token="$ENROLL" \
+  -f
+
+########################################
+# DONE
+########################################
+
+IP=$(hostname -I | awk '{print $1}')
+
+echo ""
+echo "=============================="
+echo " ELK + FLEET READY"
+echo "=============================="
+echo "Kibana: http://${IP}:${KIBANA_PORT}"
+echo "Elastic password: /root/elastic.pass"
+echo "=============================="
+┌──(iamfahadshaikh㉿TTPL-FAHAD)-[~]
+└─$
